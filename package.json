@@ -1,0 +1,8 @@
+{
+  "name": "handwatch",
+  "version": "1.0.0",
+  "description": "Hand-hygiene smartwatch prototype with a unit view for infection control",
+  "main": "main.js",
+  "scripts": { "start": "electron . --no-sandbox" },
+  "devDependencies": { "electron": "^44.5.1" }
+}
