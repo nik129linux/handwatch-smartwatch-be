@@ -26,6 +26,23 @@ buttons, sensor-noise slider, haptic vocabulary, event log.
 `js/sense.js` wiring · `js/scope.js` waveform · `js/log.js` 24 h store ·
 `js/haptics.js` vibration vocabulary · `main.js` Electron shell.
 
+## Learning + AI (system fixes, never accusations)
+
+- On-device calibration (`js/calibrate.js`, pure, tested): each "Yes, I did"
+  lifts the decision threshold a bounded step (+0.02, cap +0.12, halves every
+  2 days) for that moment + noise bucket, so repeat false marks fade while
+  real misses still flag. Home shows "Learning · fewer marks"; Who-sees
+  resets it. The classifier itself never changes.
+- Unit pattern finder (`unit.html` → `js/ai.js` rules): weakest moment and
+  quietest hours from anonymous totals only, with evidence numbers, as 1–2
+  system fixes. Each log row has a **Why** button: one neutral line
+  (≤ 140 chars) on why the watch may have been wrong.
+- Optional model: rules always answer first; with consent (the exact payload
+  shown first) Electron main asks Ollama on localhost (`ai/ollama.js`, 8 s
+  timeout) and the answer is schema-checked AND grounded (only numbers from
+  the payload count), else rules. Badge shows "Rules" or "Ollama · model".
+  Browser build is rules-only. No names/titles/free text ever leave the page.
+
 ## Rules (graded)
 
 No sound ever · never red, no accusation wording on the watch ·

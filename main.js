@@ -16,6 +16,25 @@ function logPath() {
   return path.join(app.getPath('userData'), 'log.json');
 }
 
+/* --- on-device model: the renderer sends a prompt, main talks to
+   Ollama on localhost and hands the raw text back. Aggregates only
+   ever reach this point; validation and grounding happen in js/ai.js.
+   Every failure is a value: the page falls back to its rules. */
+function setupAIIPC() {
+  let Ollama = null;
+  try {
+    Ollama = require('./ai/ollama.js');
+  } catch (e) { /* packaged without the ai folder — rules only */ }
+  ipcMain.handle('ai:query', async (_ev, prompt) => {
+    try {
+      if (!Ollama) return { ok: false, reason: 'no-model' };
+      return await Ollama.query(String(prompt === undefined ? '' : prompt));
+    } catch (e) {
+      return { ok: false, reason: 'down' };
+    }
+  });
+}
+
 function setupLogIPC() {
   ipcMain.handle('log:load', async () => {
     try {
@@ -60,6 +79,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   setupLogIPC();
+  setupAIIPC();
   createWindow();
 
   /* Ctrl+Shift+L flips the same theme hook the toggle button uses */

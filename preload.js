@@ -10,3 +10,9 @@ contextBridge.exposeInMainWorld('__logAPI', {
   load: () => ipcRenderer.invoke('log:load'),
   save: (json) => ipcRenderer.invoke('log:save', json)
 });
+
+/* Model bridge: prompts go to the main process, which asks Ollama on
+   localhost. Absent in a plain browser — then the pages use rules only. */
+contextBridge.exposeInMainWorld('__aiAPI', {
+  query: (prompt) => ipcRenderer.invoke('ai:query', prompt)
+});
