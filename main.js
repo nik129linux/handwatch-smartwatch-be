@@ -35,6 +35,118 @@ function setupAIIPC() {
   });
 }
 
+/* --- real watch: the page hands over an already-built push (title, one
+   line, priority, kind). Shape is re-checked here so nothing else can ride
+   along. Route 1: a phone on USB/Wi-Fi adb running the Hand Hygiene relay
+   app (android/), offline, the watch mirrors its notification. Route 2:
+   ntfy.sh. Failure is a value, never a throw. */
+function setupWristIPC() {
+  const { execFile } = require('child_process');
+  const TOPIC_RE = /^[a-z0-9_-]{8,64}$/;
+  const KINDS = ['reminder', 'doubtful', 'ok', 'end'];
+  /* letters, digits, spaces and a few marks: safe inside the remote
+     shell's single quotes, and all the watch font can draw anyway */
+  const clean = (v, n) => String(v || '').replace(/·/g, '-')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   /* Lávate -> Lavate */
+    .replace(/[^A-Za-z0-9 ?.,:-]/g, '').slice(0, n).trim();
+
+  function adb(args) {
+    return new Promise((resolve) => {
+      execFile('adb', args, { timeout: 4000 }, (err, out) =>
+        resolve(err ? null : String(out)));
+    });
+  }
+
+  /* Every attached target, by serial. A phone runs the relay app
+     (co.ucc.handhygiene); a Wear OS emulator runs the watch app
+     (co.ucc.handhygiene.wear). Both can be live at once. */
+  const RELAY = 'co.ucc.handhygiene';
+  const WEAR = 'co.ucc.handhygiene.wear';
+  async function targets() {
+    const out = await adb(['devices']);
+    if (!out) return [];
+    const serials = out.split('\n').slice(1)
+      .map((l) => l.trim().split(/\s+/))
+      .filter((f) => f[1] === 'device').map((f) => f[0]);
+    const found = [];
+    for (const serial of serials) {
+      const pkgs = (await adb(['-s', serial, 'shell', 'pm list packages co.ucc.handhygiene']) || '')
+        .split('\n').map((l) => l.trim().replace(/^package:/, ''));
+      if (pkgs.includes(WEAR)) found.push({ serial, type: 'wear' });
+      else if (pkgs.includes(RELAY)) found.push({ serial, type: 'phone' });
+    }
+    return found;
+  }
+
+  async function sendTo(t, title, body, kind) {
+    const extras = " --es title '" + title + "' --es body '" + body + "' --es kind '" + kind + "'";
+    const cmd = t.type === 'wear'
+      ? 'am start -n ' + WEAR + '/.AlertActivity' + extras
+      : 'am broadcast -n ' + RELAY + '/.NotifyReceiver -a ' + RELAY + '.NOTIFY' + extras;
+    const out = await adb(['-s', t.serial, 'shell', cmd]);
+    return !!out && !/Error|Exception/.test(out);
+  }
+
+  /* --- the way back: both apps log "answer=yes|no" under the tag HHW
+     (watch crown or tap, phone notification buttons). Main tails each
+     device's log over adb and hands every answer to the page. */
+  const tails = new Map();
+  /* logcat -T takes 'MM-DD hh:mm:ss.mmm': only answers from now on */
+  function stamp() {
+    const d = new Date(), p = (n, w = 2) => String(n).padStart(w, '0');
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' +
+      p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+  }
+  function listen(t) {
+    if (tails.has(t.serial)) return;
+    const { spawn } = require('child_process');
+    if (t.type === 'phone') {
+      adb(['-s', t.serial, 'shell', 'am start-foreground-service -n ' + RELAY + '/.RelayService']);
+    }
+    const proc = spawn('adb', ['-s', t.serial, 'logcat', '-T', stamp(), '-s', 'HHW:I'],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    tails.set(t.serial, proc);
+    let buf = '';
+    proc.stdout.on('data', (chunk) => {
+      buf += chunk;
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        const m = line.match(/answer=(yes|no)\b/);
+        if (m && win && !win.isDestroyed()) win.webContents.send('wrist:answer', m[1], t.type);
+      }
+    });
+    proc.on('exit', () => { tails.delete(t.serial); });
+  }
+  app.on('will-quit', () => { for (const p of tails.values()) p.kill(); });
+
+  ipcMain.handle('wrist:send', async (_ev, topic, msg) => {
+    try {
+      if (!msg) return { ok: false };
+      const title = clean(msg.title, 40);
+      const body = clean(msg.body, 80);
+      const kind = KINDS.includes(msg.kind) ? msg.kind : 'reminder';
+      if (!title) return { ok: false };
+      const routes = [];
+      for (const t of await targets()) {
+        if (await sendTo(t, title, body, kind)) { listen(t); routes.push(t.type === 'wear' ? 'watch' : 'phone'); }
+      }
+      if (routes.length) return { ok: true, route: routes.join(' + ') };
+      if (!TOPIC_RE.test(String(topic))) return { ok: false };
+      const priority = [1, 2, 3, 4, 5].includes(msg.priority) ? msg.priority : 3;
+      const r = await fetch('https://ntfy.sh/' + topic, {
+        method: 'POST',
+        body,
+        headers: { Title: title, Priority: String(priority) },
+        signal: AbortSignal.timeout(4000)
+      });
+      return { ok: r.ok, route: 'ntfy' };
+    } catch (e) {
+      return { ok: false };
+    }
+  });
+}
+
 function setupLogIPC() {
   ipcMain.handle('log:load', async () => {
     try {
@@ -80,6 +192,7 @@ function createWindow() {
 app.whenReady().then(() => {
   setupLogIPC();
   setupAIIPC();
+  setupWristIPC();
   createWindow();
 
   /* Ctrl+Shift+L flips the same theme hook the toggle button uses */

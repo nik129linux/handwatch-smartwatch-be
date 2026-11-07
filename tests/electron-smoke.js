@@ -8,7 +8,7 @@
 const path = require('path');
 const fs = require('fs');
 const { _electron } =
-  require('/home/nico/.nvm/versions/node/v22.23.2/lib/node_modules/playwright');
+  require('playwright');
 const electronPath = require('electron');
 
 const ROOT = path.resolve(__dirname, '..');
