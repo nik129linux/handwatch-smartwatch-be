@@ -10,6 +10,39 @@ const { app, BrowserWindow, globalShortcut, ipcMain } = require('electron');
 
 let win = null;
 
+/* --- wrist:send payload safety: shared by the IPC handler and the tests -- */
+const KINDS = ['reminder', 'doubtful', 'ok', 'end'];
+const LANGS = ['en', 'es'];
+/* letters, digits, spaces and a few marks: safe inside the remote
+   shell's single quotes, and all the watch font can draw anyway */
+const clean = (v, n) => String(v || '').replace(/·/g, '-')
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   /* Lávate -> Lavate */
+  .replace(/[^A-Za-z0-9 ?.,:-]/g, '').slice(0, n).trim();
+/* The Wear app draws Spanish, so its extras keep accents and ¿/¡.
+   Quotes, backslashes and every shell metacharacter still never pass. */
+const cleanWear = (v, n) => String(v || '').replace(/·/g, '-')
+  .replace(/[^A-Za-z0-9À-ÖØ-öø-ÿÑñÜü¿¡ ?.,:!-]/g, '').slice(0, n).trim();
+const clampInt = (v, fallback) => {
+  const n = typeof v === 'number' ? v : parseInt(v, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(99, Math.trunc(n)));
+};
+/* One sanitizer for the wrist:send payload. Bad values become the same
+   defaults js/wrist.js uses (en, 0, 15); numbers are clamped to 0..99. */
+function sanitizeWrist(msg) {
+  const m = msg || {};
+  return {
+    title: cleanWear(m.title, 40),
+    body: cleanWear(m.body, 80),
+    phoneTitle: clean(m.title, 40),
+    phoneBody: clean(m.body, 80),
+    kind: KINDS.includes(m.kind) ? m.kind : 'reminder',
+    lang: LANGS.includes(m.lang) ? m.lang : 'en',
+    done: clampInt(m.done, 0),
+    plan: clampInt(m.plan, 15)
+  };
+}
+
 /* --- event log file: the Electron copy of the on-watch log ------------- */
 
 function logPath() {
@@ -43,12 +76,6 @@ function setupAIIPC() {
 function setupWristIPC() {
   const { execFile } = require('child_process');
   const TOPIC_RE = /^[a-z0-9_-]{8,64}$/;
-  const KINDS = ['reminder', 'doubtful', 'ok', 'end'];
-  /* letters, digits, spaces and a few marks: safe inside the remote
-     shell's single quotes, and all the watch font can draw anyway */
-  const clean = (v, n) => String(v || '').replace(/·/g, '-')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   /* Lávate -> Lavate */
-    .replace(/[^A-Za-z0-9 ?.,:-]/g, '').slice(0, n).trim();
 
   function adb(args) {
     return new Promise((resolve) => {
@@ -78,9 +105,15 @@ function setupWristIPC() {
     return found;
   }
 
-  async function sendTo(t, title, body, kind) {
-    const extras = " --es title '" + title + "' --es body '" + body + "' --es kind '" + kind + "'";
-    const cmd = t.type === 'wear'
+  async function sendTo(t, m) {
+    const wear = t.type === 'wear';
+    const title = wear ? m.title : m.phoneTitle;
+    const body = wear ? m.body : m.phoneBody;
+    if (!title) return false;
+    let extras = " --es title '" + title + "' --es body '" + body + "' --es kind '" + m.kind + "'";
+    /* The Wear app needs the language and the Home counters with every alert. */
+    if (wear) extras += " --es lang '" + m.lang + "' --ei done " + m.done + " --ei plan " + m.plan;
+    const cmd = wear
       ? 'am start -n ' + WEAR + '/.AlertActivity' + extras
       : 'am broadcast -n ' + RELAY + '/.NotifyReceiver -a ' + RELAY + '.NOTIFY' + extras;
     const out = await adb(['-s', t.serial, 'shell', cmd]);
@@ -123,21 +156,20 @@ function setupWristIPC() {
   ipcMain.handle('wrist:send', async (_ev, topic, msg) => {
     try {
       if (!msg) return { ok: false };
-      const title = clean(msg.title, 40);
-      const body = clean(msg.body, 80);
-      const kind = KINDS.includes(msg.kind) ? msg.kind : 'reminder';
-      if (!title) return { ok: false };
+      const m = sanitizeWrist(msg);
+      if (!m.title && !m.phoneTitle) return { ok: false };
       const routes = [];
       for (const t of await targets()) {
-        if (await sendTo(t, title, body, kind)) { listen(t); routes.push(t.type === 'wear' ? 'watch' : 'phone'); }
+        if (await sendTo(t, m)) { listen(t); routes.push(t.type === 'wear' ? 'watch' : 'phone'); }
       }
       if (routes.length) return { ok: true, route: routes.join(' + ') };
+      if (!m.phoneTitle) return { ok: false };
       if (!TOPIC_RE.test(String(topic))) return { ok: false };
       const priority = [1, 2, 3, 4, 5].includes(msg.priority) ? msg.priority : 3;
       const r = await fetch('https://ntfy.sh/' + topic, {
         method: 'POST',
-        body,
-        headers: { Title: title, Priority: String(priority) },
+        body: m.phoneBody,
+        headers: { Title: m.phoneTitle, Priority: String(priority) },
         signal: AbortSignal.timeout(4000)
       });
       return { ok: r.ok, route: 'ntfy' };
@@ -189,35 +221,41 @@ function createWindow() {
   win.on('closed', () => { win = null; });
 }
 
-app.whenReady().then(() => {
-  setupLogIPC();
-  setupAIIPC();
-  setupWristIPC();
-  createWindow();
+/* Tests require this file in plain Node to exercise the sanitizer:
+   only the Electron main process may start the app. */
+if (process.versions.electron) {
+  app.whenReady().then(() => {
+    setupLogIPC();
+    setupAIIPC();
+    setupWristIPC();
+    createWindow();
 
-  /* Ctrl+Shift+L flips the same theme hook the toggle button uses */
-  globalShortcut.register('CommandOrControl+Shift+L', () => {
-    if (win && !win.isDestroyed()) {
-      win.webContents.executeJavaScript(
-        'window.__toggleTheme && window.__toggleTheme()'
-      ).catch(() => { /* page not ready yet */ });
-    }
+    /* Ctrl+Shift+L flips the same theme hook the toggle button uses */
+    globalShortcut.register('CommandOrControl+Shift+L', () => {
+      if (win && !win.isDestroyed()) {
+        win.webContents.executeJavaScript(
+          'window.__toggleTheme && window.__toggleTheme()'
+        ).catch(() => { /* page not ready yet */ });
+      }
+    });
+
+    /* F11 fullscreen */
+    globalShortcut.register('F11', () => {
+      if (win && !win.isDestroyed()) win.setFullScreen(!win.isFullScreen());
+    });
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
 
-  /* F11 fullscreen */
-  globalShortcut.register('F11', () => {
-    if (win && !win.isDestroyed()) win.setFullScreen(!win.isFullScreen());
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
   });
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  app.on('will-quit', () => {
+    globalShortcut.unregisterAll();
   });
-});
+}
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
-});
+module.exports = { sanitizeWrist, clean, cleanWear };
